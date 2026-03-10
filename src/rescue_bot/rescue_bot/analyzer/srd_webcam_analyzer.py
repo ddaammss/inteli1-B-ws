@@ -199,6 +199,11 @@ class SeverityAnalyzer:
         shoulder_span = 0.0
         if ls is not None and rs is not None:
             shoulder_span = abs(float(rs[0] - ls[0]))
+            
+        # 1. 측면(옆보기) 방어 로직 (전신/상반신 공통 적용)
+        # 어깨 폭이 바운딩 박스의 25% 이하면 몸을 옆으로 돌린 것으로 간주하고 어깨 기울기를 0으로 초기화
+        if shoulder_span < bw * self.cfg.upper_body_min_shoulder_span_ratio:
+            shoulder_tilt = 0.0
 
         # [v0.530 핵심] head_down_score: 머리 처짐을 어깨 폭 기준으로 수치화
         # 기존에는 바운딩 박스 단위(bh)를 사용하여, 상체만 보일 때 값이 비정상적으로 튀는 문제가 있었습니다.
@@ -235,12 +240,6 @@ class SeverityAnalyzer:
             return "NORMAL", shoulder_tilt, head_down_score, torso_angle
 
         if obs == "UPPER_BODY":
-            # 1. 측면(옆보기) 방어 로직
-            # 어깨 폭이 바운딩 박스의 25% 이하면 몸을 옆으로 돌린 것으로 간주하고 기울기를 0으로 초기화
-            if ls is not None and rs is not None:
-                shoulder_span = abs(float(rs[0] - ls[0]))
-                if shoulder_span < bw * self.cfg.upper_body_min_shoulder_span_ratio:
-                    shoulder_tilt = 0.0
 
             # 2. 상반신 자세 이상 판별
             # 하체 정보가 없어 불확실하므로, 머리 처짐(head_down_score)이나 어깨 꺾임(shoulder_tilt) 
