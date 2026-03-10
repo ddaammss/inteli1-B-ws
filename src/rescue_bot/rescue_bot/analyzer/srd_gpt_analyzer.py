@@ -1,4 +1,4 @@
-# v0.520
+# v0.530
 import math
 import time
 from collections import deque
@@ -27,8 +27,11 @@ class AnalyzerConfig:
     # posture thresholds (신체 기울기 및 자세 불량 기준 임계값 정의)
     leaning_shoulder_tilt_deg: float = 25.0
     collapsed_shoulder_tilt_deg: float = 45.0
-    leaning_head_drop_ratio: float = 0.22
-    collapsed_head_drop_ratio: float = 0.38
+    # head_down_score:
+    # 0.0에 가까울수록 얼굴이 어깨보다 충분히 위
+    # 1.0에 가까울수록 얼굴이 어깨에 매우 가까움/아래
+    leaning_head_down_score: float = 0.55
+    collapsed_head_down_score: float = 0.78
     collapsed_torso_angle_deg: float = 60.0    # 몸통(어깨-골반 선)이 수직선 기준 이 각도 이상 누우면 쓰러짐 판정
     lying_torso_angle_deg: float = 72.0        # 몸통 각도가 거의 눕다시피 한 수평(Lying) 상태 기준
     lying_aspect_ratio: float = 2.00           # 바운딩 박스 가로/세로 비율 (가로가 세로보다 2.0배 이상 길면 누움)
@@ -161,7 +164,7 @@ class SeverityAnalyzer:
         box: np.ndarray,
         obs: str,
         shape: Tuple[int, int, int],
-    ) -> Tuple[str, float, float]:
+    ) -> Tuple[str, float, float, float]:
         x1, y1, x2, y2 = box.astype(float)
         bw = max(x2 - x1, 1.0)
         bh = max(y2 - y1, 1.0)
@@ -185,9 +188,17 @@ class SeverityAnalyzer:
 
         shoulder_tilt = self._angle_deg(ls, rs) if ls is not None and rs is not None else 0.0
 
-        head_drop = 0.0
-        if face_anchor is not None and shoulder_center is not None:
-            head_drop = max(float(face_anchor[1] - shoulder_center[1]), 0.0) / bh
+        shoulder_span = 0.0
+        if ls is not None and rs is not None:
+            shoulder_span = abs(float(rs[0] - ls[0]))
+
+        # head_down_score:
+        # 얼굴이 어깨보다 충분히 위에 있으면 0에 가까움
+        # 얼굴이 어깨에 가까워질수록 1에 가까워짐
+        head_down_score = 0.0
+        if face_anchor is not None and shoulder_center is not None and shoulder_span > 1.0:
+            head_gap = max(float(shoulder_center[1] - face_anchor[1]), 0.0)
+            head_down_score = 1.0 - min(head_gap / shoulder_span, 1.0)
 
         torso_angle = 0.0
         if shoulder_center is not None and hip_center is not None:
@@ -195,47 +206,44 @@ class SeverityAnalyzer:
 
         if obs == "FULL_BODY":
             if aspect >= self.cfg.lying_aspect_ratio or torso_angle >= self.cfg.lying_torso_angle_deg:
-                return "LYING", shoulder_tilt, head_drop
+                return "LYING", shoulder_tilt, head_down_score, torso_angle
 
             if (
                 torso_angle >= self.cfg.collapsed_torso_angle_deg
                 or shoulder_tilt >= self.cfg.collapsed_shoulder_tilt_deg
-                or head_drop >= self.cfg.collapsed_head_drop_ratio
+                or head_down_score >= self.cfg.collapsed_head_down_score
             ):
-                return "COLLAPSED", shoulder_tilt, head_drop
+                return "COLLAPSED", shoulder_tilt, head_down_score, torso_angle
 
             if (
                 shoulder_tilt >= self.cfg.leaning_shoulder_tilt_deg
-                or head_drop >= self.cfg.leaning_head_drop_ratio
+                or head_down_score >= self.cfg.leaning_head_down_score
             ):
-                return "LEANING", shoulder_tilt, head_drop
+                return "LEANING", shoulder_tilt, head_down_score, torso_angle
 
-            return "NORMAL", shoulder_tilt, head_drop
+            return "NORMAL", shoulder_tilt, head_down_score, torso_angle
 
         if obs == "UPPER_BODY":
-            # 상반신은 어깨 두 점이 너무 좁으면 기울기 계산을 신뢰하지 않음
             if ls is not None and rs is not None:
                 shoulder_span = abs(float(rs[0] - ls[0]))
                 if shoulder_span < bw * self.cfg.upper_body_min_shoulder_span_ratio:
                     shoulder_tilt = 0.0
 
-            # 상반신에서는 tilt/head_drop 둘 중 하나가 충분히 크면 자세 이상으로 본다.
-            # 단, COLLAPSED는 기준을 더 높게 둤서 쉽게 뜨지 않게 함.
             if (
                 shoulder_tilt >= self.cfg.collapsed_shoulder_tilt_deg
-                or head_drop >= self.cfg.collapsed_head_drop_ratio
+                or head_down_score >= self.cfg.collapsed_head_down_score
             ):
-                return "COLLAPSED", shoulder_tilt, head_drop
+                return "COLLAPSED", shoulder_tilt, head_down_score, torso_angle
 
             if (
                 shoulder_tilt >= self.cfg.leaning_shoulder_tilt_deg
-                or head_drop >= self.cfg.leaning_head_drop_ratio
+                or head_down_score >= self.cfg.leaning_head_down_score
             ):
-                return "LEANING", shoulder_tilt, head_drop
+                return "LEANING", shoulder_tilt, head_down_score, torso_angle
 
-            return "NORMAL", shoulder_tilt, head_drop
+            return "NORMAL", shoulder_tilt, head_down_score, torso_angle
 
-        return "UNKNOWN", shoulder_tilt, head_drop
+        return "UNKNOWN", shoulder_tilt, head_down_score, torso_angle
 
     def _motion_value(
         self,
@@ -411,7 +419,7 @@ class SeverityAnalyzer:
             clipped_box = np.array([x1, y1, x2, y2], dtype=np.float32)
 
             obs = self._classify_observation(kps, kp_conf, frame.shape)
-            posture, shoulder_tilt, head_drop = self._classify_posture(kps, kp_conf, clipped_box, obs, frame.shape)
+            posture, shoulder_tilt, head_down_score, torso_angle = self._classify_posture(kps, kp_conf, clipped_box, obs, frame.shape)
             smooth, upper, core = self._motion_value(track_id, kps, kp_conf, clipped_box, frame.shape)
             motion = self._classify_motion(smooth, upper, core)
             trapped = self._possible_trapped(obs, posture, motion)
@@ -424,7 +432,7 @@ class SeverityAnalyzer:
 
             line1 = f"ID {track_id} | {severity}"
             line2 = f"{obs} | {posture} | {motion}"
-            line3 = f"tilt:{shoulder_tilt:.1f} hd:{head_drop:.2f} m:{smooth:.3f}"
+            line3 = f"tilt:{shoulder_tilt:.1f} hds:{head_down_score:.2f} m:{smooth:.3f}"
 
             ty = max(20, y1 - 10)
             cv2.putText(annotated, line1, (x1, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
