@@ -1,0 +1,159 @@
+# v0.600
+"""
+SRD Pose Severity ROS2 Node
+===========================
+
+이 파일은 실제 TurtleBot4 환경에서 사용하는 ROS2 노드 파일이다.
+역할은 명확하다.
+
+1) compressed image 토픽을 구독한다.
+2) JPEG 이미지를 OpenCV 프레임으로 디코딩한다.
+3) PoseSeverityEngine을 호출한다.
+4) 분석 결과(JSON)와 시각화 이미지(compressed)를 publish 한다.
+
+즉, 이 파일은 ROS2 입출력 담당이고,
+실제 포즈 분석 로직 자체는 srd_pose_severity_core.py 에 있다.
+"""
+
+import json
+from typing import List
+
+import cv2
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import String
+
+try:
+    from .srd_pose_severity_core import AnalyzerConfig, PoseSeverityEngine
+except ImportError:
+    from srd_pose_severity_core import AnalyzerConfig, PoseSeverityEngine
+
+
+class SrdPoseSeverityNode(Node):
+    """SRD Pose Severity ROS2 Node.
+
+    구독 토픽:
+    - input_image_topic (CompressedImage)
+
+    발행 토픽:
+    - result_topic (String JSON)
+    - annotated_topic (CompressedImage)
+    """
+
+    def __init__(self):
+        super().__init__("srd_pose_severity_node")
+
+        # --------------------------------------------------------------
+        # ROS2 파라미터 선언
+        # 실제 로봇 환경에서는 launch 파일 또는 ros2 param 으로 덮어쓸 수 있다.
+        # --------------------------------------------------------------
+        self.declare_parameter("model_path", "yolo11n-pose.pt")
+        self.declare_parameter("input_image_topic", "/camera/image_raw/compressed")
+        self.declare_parameter("result_topic", "/srd/result_json")
+        self.declare_parameter("annotated_topic", "/srd/annotated/compressed")
+        self.declare_parameter("publish_annotated", True)
+        self.declare_parameter("show_debug", True)
+
+        model_path = self.get_parameter("model_path").get_parameter_value().string_value
+        input_image_topic = self.get_parameter("input_image_topic").get_parameter_value().string_value
+        result_topic = self.get_parameter("result_topic").get_parameter_value().string_value
+        annotated_topic = self.get_parameter("annotated_topic").get_parameter_value().string_value
+        self.publish_annotated = self.get_parameter("publish_annotated").get_parameter_value().bool_value
+        show_debug = self.get_parameter("show_debug").get_parameter_value().bool_value
+
+        # --------------------------------------------------------------
+        # 분석 코어 설정 / 생성
+        # --------------------------------------------------------------
+        cfg = AnalyzerConfig(model_path=model_path, show_debug=show_debug)
+        self.engine = PoseSeverityEngine(cfg)
+
+        # --------------------------------------------------------------
+        # Publisher / Subscriber 생성
+        # --------------------------------------------------------------
+        self.result_pub = self.create_publisher(String, result_topic, 10)
+        self.annotated_pub = self.create_publisher(CompressedImage, annotated_topic, 10)
+
+        self.image_sub = self.create_subscription(
+            CompressedImage,
+            input_image_topic,
+            self.image_callback,
+            10,
+        )
+
+        self.get_logger().info(
+            f"SRD Pose Severity Node started. input={input_image_topic}, result={result_topic}, annotated={annotated_topic}"
+        )
+
+    # ------------------------------------------------------------------
+    # 이미지 디코딩 / 인코딩 보조 함수
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _decode_compressed_image(msg: CompressedImage) -> np.ndarray:
+        """ROS2 CompressedImage 메시지를 OpenCV BGR 이미지로 디코딩한다."""
+        np_arr = np.frombuffer(msg.data, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("Failed to decode compressed image.")
+        return frame
+
+    @staticmethod
+    def _encode_compressed_image(frame: np.ndarray, header_stamp, format_str: str = "jpeg") -> CompressedImage:
+        """OpenCV BGR 이미지를 ROS2 CompressedImage 메시지로 인코딩한다."""
+        ok, encoded = cv2.imencode(".jpg", frame)
+        if not ok:
+            raise ValueError("Failed to encode annotated image.")
+
+        msg = CompressedImage()
+        msg.header.stamp = header_stamp
+        msg.format = format_str
+        msg.data = encoded.tobytes()
+        return msg
+
+    # ------------------------------------------------------------------
+    # 결과 publish 보조 함수
+    # ------------------------------------------------------------------
+    def _publish_result_json(self, results: List[dict]) -> None:
+        """분석 결과 리스트를 JSON 문자열로 발행한다."""
+        payload = {"detections": results}
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self.result_pub.publish(msg)
+
+    # ------------------------------------------------------------------
+    # 메인 callback
+    # ------------------------------------------------------------------
+    def image_callback(self, msg: CompressedImage) -> None:
+        """compressed image를 받아 분석하고 결과를 publish 한다."""
+        try:
+            # 1) compressed image -> OpenCV frame 디코딩
+            frame = self._decode_compressed_image(msg)
+
+            # 2) 분석 코어 호출
+            annotated, results = self.engine.analyze_frame_with_results(frame)
+
+            # 3) 결과 JSON 발행
+            self._publish_result_json(results)
+
+            # 4) 필요 시 annotated image도 compressed로 발행
+            if self.publish_annotated:
+                annotated_msg = self._encode_compressed_image(annotated, msg.header.stamp)
+                self.annotated_pub.publish(annotated_msg)
+
+        except Exception as exc:
+            self.get_logger().error(f"image_callback failed: {exc}")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SrdPoseSeverityNode()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
