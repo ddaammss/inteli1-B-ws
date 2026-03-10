@@ -1,4 +1,4 @@
-# SLAM 기반 다중 TurtleBot4 협업 구조 지원 시스템
+# 재난구조 로봇(RR:Rescue Robot)
 
 ## 1. 프로젝트 개요
 
