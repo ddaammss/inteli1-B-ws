@@ -1,0 +1,13 @@
+build/
+install/
+log/
+.vscode/
+
+# Ignore compiled python files
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore database and large model files
+*.db
+*.pt
