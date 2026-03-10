@@ -188,13 +188,16 @@ class SeverityAnalyzer:
 
         shoulder_tilt = self._angle_deg(ls, rs) if ls is not None and rs is not None else 0.0
 
+        # [v0.530] 측면 확인 및 거리 정규화를 위한 어깨 픽셀 폭(Shoulder Span)
+        # 카메라는 2D이므로 사람이 측면으로 돌면 어깨 폭이 좁아집니다.
         shoulder_span = 0.0
         if ls is not None and rs is not None:
             shoulder_span = abs(float(rs[0] - ls[0]))
 
-        # head_down_score:
-        # 얼굴이 어깨보다 충분히 위에 있으면 0에 가까움
-        # 얼굴이 어깨에 가까워질수록 1에 가까워짐
+        # [v0.530 핵심] head_down_score: 머리 처짐을 어깨 폭 기준으로 수치화
+        # 기존에는 바운딩 박스 단위(bh)를 사용하여, 상체만 보일 때 값이 비정상적으로 튀는 문제가 있었습니다.
+        # 이를 해결하기 위해, 어깨부터 얼굴까지의 y축 거리를 기준(어깨 폭)으로 나눠서 절대적인 0~1 점수로 환산합니다.
+        # 0.0: 완전 정상 (얼굴이 어깨 위쪽에 잘 있음), 1.0: 심각 (얼굴이 어깨선 이하로 파묻힘)
         head_down_score = 0.0
         if face_anchor is not None and shoulder_center is not None and shoulder_span > 1.0:
             head_gap = max(float(shoulder_center[1] - face_anchor[1]), 0.0)
@@ -224,11 +227,17 @@ class SeverityAnalyzer:
             return "NORMAL", shoulder_tilt, head_down_score, torso_angle
 
         if obs == "UPPER_BODY":
+            # 1. 측면(옆보기) 방어 로직
+            # 어깨 폭이 바운딩 박스의 25% 이하면 몸을 옆으로 돌린 것으로 간주하고 기울기를 0으로 초기화
             if ls is not None and rs is not None:
                 shoulder_span = abs(float(rs[0] - ls[0]))
                 if shoulder_span < bw * self.cfg.upper_body_min_shoulder_span_ratio:
                     shoulder_tilt = 0.0
 
+            # 2. 상반신 자세 이상 판별
+            # 하체 정보가 없어 불확실하므로, 머리 처짐(head_down_score)이나 어깨 꺾임(shoulder_tilt) 
+            # 단일 증상 중 하나라도 기준을 넘으면 자세 이상으로 잡되, 
+            # 쓰러짐(COLLAPSED) 오판을 막기 위해 Config에서 임계치를 높게 조절합니다.
             if (
                 shoulder_tilt >= self.cfg.collapsed_shoulder_tilt_deg
                 or head_down_score >= self.cfg.collapsed_head_down_score
