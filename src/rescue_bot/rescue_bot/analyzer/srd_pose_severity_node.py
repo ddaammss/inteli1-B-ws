@@ -51,7 +51,7 @@ class SrdPoseSeverityNode(Node):
         self.declare_parameter("input_image_topic", "/camera/image_raw/compressed")
         # 최종 severity 문자열 publish 토픽
         self.declare_parameter("severity_topic", "/robot6/srd/severity")
-        self.declare_parameter("annotated_topic", "/srd/annotated/compressed")
+        self.declare_parameter("annotated_topic", "/robot6/srd/annotated/compressed")
         self.declare_parameter("publish_annotated", True)
         self.declare_parameter("show_debug", True)
 
