@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'final_project'
+package_name = 'rescue_bot'
 
 setup(
     name=package_name,
