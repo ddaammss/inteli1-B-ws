@@ -38,6 +38,7 @@ setup(
             'rescue_control_node = rescue_bot.analyzer.rescue_control_node:main',
             'rescue_nav_node = rescue_bot.analyzer.rescue_nav_node:main',
             'rescue_stt_node = rescue_bot.analyzer.rescue_stt_node:main',
+            'rescue_webcam_pub_node = rescue_bot.analyzer.rescue_webcam_pub_node:main',
         ],
     },
 )
