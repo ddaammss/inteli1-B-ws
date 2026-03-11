@@ -11,3 +11,10 @@ __pycache__/
 # Ignore database and large model files
 *.db
 *.pt
+
+# Ignore legacy analyzer code
+src/rescue_bot/rescue_bot/analyzer/archive/
+src/rescue_bot/rescue_bot/analyzer/webcam_legacy/
+
+# Ignore test files
+src/rescue_bot/rescue_bot/tests/
