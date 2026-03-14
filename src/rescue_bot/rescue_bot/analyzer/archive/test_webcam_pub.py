@@ -11,9 +11,13 @@ class WebcamPublisher(Node):
         self.cap = cv2.VideoCapture(0)
         
         if not self.cap.isOpened():
-            self.get_logger().error("웹캠(0번)을 열 수 없습니다!")
+            self.get_logger().warn("웹캠 0번을 열 수 없습니다. 1번을 시도합니다...")
+            self.cap = cv2.VideoCapture(1)
+
+        if not self.cap.isOpened():
+            self.get_logger().error("웹캠 0번, 1번 모두 열 수 없습니다! USB 연결을 확인해주세요.")
         else:
-            self.get_logger().info("웹캠 퍼블리셔 시작! 토픽: /camera/image_raw/compressed")
+            self.get_logger().info("✅ 웹캠 퍼블리셔 정상 연결 및 시작! 토픽: /camera/image_raw/compressed")
 
     def timer_callback(self):
         ret, frame = self.cap.read()

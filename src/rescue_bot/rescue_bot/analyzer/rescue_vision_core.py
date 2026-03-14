@@ -846,9 +846,19 @@ class PoseEmergencyEngine:
             # 5단계: 대망의 최종 위급 등급 산정 (WARNING? CRITICAL?)
             emergency_level = self._decide(visibility, posture, motion, trapped, seen_sec, state_sec)
 
+            # 5-1) 대표 포인트(Rep. Point) 추출 (v0.620 관제용 기능)
+            rep_point, shoulder_center, hip_center, face_anchor, rep_method = self._extract_rep_points(
+                kps, kp_conf, clipped_box, visibility, frame.shape
+            )
+
             # 6단계: 모든 상태 분석이 끝났으니, 그 결과에 맞춰 사람 몸 위에 색깔과 점을 덧칠합니다.
             color = self.COLORS[emergency_level] # 위급 단계별 색상 지정 (NORMAL=초록, CRITICAL=빨강 등)
             self._draw_skeleton(annotated, kps, kp_conf, visibility, color)
+
+            # 대표 포인트(Rep. Point) 시각화: 십자선(+) 표시
+            if rep_point is not None:
+                rx, ry = int(rep_point[0]), int(rep_point[1])
+                cv2.drawMarker(annotated, (rx, ry), color, markerType=cv2.MARKER_CROSS, markerSize=10, thickness=2)
 
             # 설정에서 그리기 옵션이 켜져있다면 사람 주변을 네모 박스로 감쌉니다.
             if self.cfg.draw_box:
@@ -904,6 +914,11 @@ class PoseEmergencyEngine:
                     motion_smooth=smooth,
                     motion_upper=upper,
                     motion_core=core,
+                    rep_point_px=self._pt_to_list(rep_point),
+                    rep_point_method=rep_method,
+                    shoulder_center_px=self._pt_to_list(shoulder_center),
+                    hip_center_px=self._pt_to_list(hip_center),
+                    face_anchor_px=self._pt_to_list(face_anchor),
                 )
             )
 

@@ -24,9 +24,18 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 try:
-    from .srd_pose_emergency_core import AnalyzerConfig, PoseEmergencyEngine
-except ImportError:
+    # 1. 패키지 내 실행 시 (ros2 run)
     from .rescue_vision_core import AnalyzerConfig, PoseEmergencyEngine
+except (ImportError, ValueError):
+    # 2. 개별 파일로 실행 시 (python3 ...)
+    try:
+        from rescue_vision_core import AnalyzerConfig, PoseEmergencyEngine
+    except ImportError:
+        # 3. 최후의 수단: 파일명 직접 지정
+        import os
+        import sys
+        sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+        from rescue_vision_core import AnalyzerConfig, PoseEmergencyEngine
 
 
 class RescueVisionNode(Node):
@@ -56,8 +65,8 @@ class RescueVisionNode(Node):
         # 1. 사용할 파라미터들의 이름과 '기본값(default)'을 미리 시스템에 등록합니다.
         self.declare_parameter("model_path", "yolo11n-pose.pt")
         self.declare_parameter("input_image_topic", "/camera/image_raw/compressed")
-        self.declare_parameter("emergency_level_topic", "/robot6/emergency_level") # 최종 판정 문자열 발행
-        self.declare_parameter("image_result_topic", "/robot6/image_result/compressed") # 뼈대 그려진 그림 발행
+        self.declare_parameter("emergency_level_topic", "/robot6/srd/emergency_level") # 최종 판정 문자열 발행
+        self.declare_parameter("image_result_topic", "/robot6/srd/image_result/compressed") # 뼈대 그려진 그림 발행
         self.declare_parameter("publish_annotated", True) # 뼈대 이미지를 실제로 보낼지 말지 On/Off 스위치
         self.declare_parameter("show_debug", True)        # 이미지 밑에 글씨(각도 등 디버깅 정보)를 띄울지 On/Off 스위치
 

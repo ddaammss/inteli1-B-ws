@@ -1,21 +1,7 @@
-# ============================================================================
-# 파일명: robot6_control_node_v0_100.py
-# 버전: v0.210
-# 날짜: 2026-03-11
-# 변경사항:
-# - v0.100: robot6 관제노드 1차 뼈대 작성
-# - v0.110: 상태머신(SEARCH/FRAME/VERIFY/MEASURING/RESULT_LOCKED/WAIT_TTS_DONE) 정리
-# - v0.120: body 타입별 집계(full/upper/partial) 및 최종 result JSON 추가
-# - v0.130: victim_position(depth + K + TF map 변환) 로직 추가
-# - v0.140: target selection / yaw align / backoff / verify 흐름 정리
-# - v0.150: session reset / TTS request / final result publish 추가
-# - v0.160: latest raw bytes만 저장하고 step()에서 디코딩하도록 변경
-# - v0.170: target lost patience(timeout) 로직 추가
-# - v0.180: MultiThreadedExecutor + callback group 구조 반영
-# - v0.190: FULL_BODY too_close도 backoff 후보에 포함되도록 제어 보강
-# - v0.200: 실행형 main, 예외 처리, 상태 publish, 결과 집계 함수 정리
-# - v0.210: core export `rep_point_px` 최우선 사용 / _select_position_pixel fallback 적용
-# ============================================================================
+# rescue_control_node.py v0.710 2026-03-14
+# [이번 버전에서 수정된 사항]
+# - History 연동 이벤트 토픽에 reliable/transient_local/keep_last(1) QoS 적용
+# - /robot6/tts/done 구독 QoS를 이벤트 퍼블리셔와 일치하도록 조정
 
 from __future__ import annotations
 
@@ -35,7 +21,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import Bool, String
@@ -64,6 +50,7 @@ class Robot6ControlNode(Node):
         self.declare_parameter("camera_info_topic", "/robot6/oakd/stereo/camera_info")
         self.declare_parameter("arrived_topic", "/robot6/mission/arrived")
         self.declare_parameter("tts_done_topic", "/robot6/tts/done")
+        self.declare_parameter("mission_abort_topic", "/robot6/mission/abort")
         self.declare_parameter("cmd_vel_topic", "/robot6/cmd_vel")
         self.declare_parameter("result_topic", "/robot6/session/result")
         self.declare_parameter("status_topic", "/robot6/session/status")
@@ -75,7 +62,9 @@ class Robot6ControlNode(Node):
         self.declare_parameter("show_debug", True)
 
         self.declare_parameter("center_tol_px", 100)
+        self.declare_parameter("center_tol_y_px", 70)
         self.declare_parameter("edge_margin_px", 5)
+        self.declare_parameter("vertical_edge_margin_px", 30)
         self.declare_parameter("verify_n", 10)
         self.declare_parameter("measure_min_sec", 10.0)
         self.declare_parameter("measure_min_stable_frames", 50)
@@ -97,6 +86,7 @@ class Robot6ControlNode(Node):
         camera_info_topic = str(self.get_parameter("camera_info_topic").value)
         arrived_topic = str(self.get_parameter("arrived_topic").value)
         tts_done_topic = str(self.get_parameter("tts_done_topic").value)
+        mission_abort_topic = str(self.get_parameter("mission_abort_topic").value)
         cmd_vel_topic = str(self.get_parameter("cmd_vel_topic").value)
         result_topic = str(self.get_parameter("result_topic").value)
         status_topic = str(self.get_parameter("status_topic").value)
@@ -108,7 +98,9 @@ class Robot6ControlNode(Node):
         show_debug = bool(self.get_parameter("show_debug").value)
 
         self.CENTER_TOL_PX = int(self.get_parameter("center_tol_px").value)
+        self.CENTER_TOL_Y_PX = int(self.get_parameter("center_tol_y_px").value)
         self.EDGE_MARGIN_PX = int(self.get_parameter("edge_margin_px").value)
+        self.VERTICAL_EDGE_MARGIN_PX = int(self.get_parameter("vertical_edge_margin_px").value)
         self.VERIFY_N = int(self.get_parameter("verify_n").value)
         self.MEASURE_MIN_SEC = float(self.get_parameter("measure_min_sec").value)
         self.MEASURE_MIN_STABLE_FRAMES = int(self.get_parameter("measure_min_stable_frames").value)
@@ -167,6 +159,7 @@ class Robot6ControlNode(Node):
         self.tts_done = False
         self.framing_forced = False
         self.state_start_t = time.time()
+        self.abort_requested = False
 
         self.current_track_id: Optional[int] = None
         self.current_target: Optional[Dict[str, Any]] = None
@@ -179,6 +172,7 @@ class Robot6ControlNode(Node):
         self.low_conf_count = 0
         self.no_person_count = 0
         self.framing_forced = False
+        self.last_action_log_key: Optional[Tuple[str, str, int, int]] = None
 
         self.bucket_overall: List[Dict[str, Any]] = []
         self.bucket_full_body: List[Dict[str, Any]] = []
@@ -196,13 +190,20 @@ class Robot6ControlNode(Node):
         # ------------------------------------------------------------------
         # ROS pubs/subs/timer
         # ------------------------------------------------------------------
+        event_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
         self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
         self.result_pub = self.create_publisher(String, result_topic, 10)
         self.status_pub = self.create_publisher(String, status_topic, 10)
-        self.tts_req_pub = self.create_publisher(String, tts_req_topic, 10)
+        self.tts_req_pub = self.create_publisher(String, tts_req_topic, event_qos)
         self.image_pub = self.create_publisher(Image, image_result_topic, 10)
         self.image_compressed_pub = self.create_publisher(CompressedImage, image_result_topic + "/compressed", 10)
-        self.victim_pose_pub = self.create_publisher(PoseStamped, victim_pose_topic, 10)
+        self.victim_pose_pub = self.create_publisher(PoseStamped, victim_pose_topic, event_qos)
 
         self.create_subscription(
             Bool,
@@ -215,6 +216,13 @@ class Robot6ControlNode(Node):
             Bool,
             tts_done_topic,
             self.tts_done_callback,
+            event_qos,
+            callback_group=self.control_group,
+        )
+        self.create_subscription(
+            Bool,
+            mission_abort_topic,
+            self.mission_abort_callback,
             10,
             callback_group=self.control_group,
         )
@@ -268,6 +276,15 @@ class Robot6ControlNode(Node):
             self.tts_done = True
             self.state = "SESSION_END"
 
+    def mission_abort_callback(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+        if self.state == "WAIT_ARRIVAL":
+            self.get_logger().info("Ignoring mission abort. Already in WAIT_ARRIVAL.")
+            return
+        self.abort_requested = True
+        self.get_logger().warn(f"Mission abort requested by nav while state={self.state}")
+
     def camera_info_callback(self, msg: CameraInfo) -> None:
         with self.sensor_lock:
             self.K = np.array(msg.k, dtype=np.float32).reshape(3, 3)
@@ -287,64 +304,122 @@ class Robot6ControlNode(Node):
     # ------------------------------------------------------------------
     def step(self) -> None:
         try:
-            # 1. 센서 데이터 스냅샷 가져오기 (항상 수행)
-            snapshot = self._get_sensor_snapshot()
-            
-            # 주기적인 상태 로그 (데이터가 없어도 현재 상태 확인 가능하게)
-            now_t = time.time()
-            if not hasattr(self, '_last_state_log_t'): self._last_state_log_t = 0
-            if (now_t - self._last_state_log_t) > 2.0:
-                self.get_logger().info(f"[Step] Current State: {self.state} | Person In View: {self.current_target is not None}")
-                self._last_state_log_t = now_t
+            if self._consume_abort_request():
+                self._publish_status()
+                return
 
+            snapshot = self._get_sensor_snapshot()
+            self._log_step_state()
             if snapshot is None:
                 self._publish_status()
                 return
 
-            # 2. YOLO 분석 및 타겟팅 (항상 수행 - Always-on Video)
-            # WAIT_TTS_DONE이나 SESSION_END 상태일 때는 이전 어노테이션 유지하거나 원본 출력
-            if self.state in ("WAIT_TTS_DONE", "SESSION_END"):
-                annotated = self.last_annotated if self.last_annotated is not None else snapshot["rgb"]
-                target = None
-            else:
-                annotated, results = self.engine.analyze_frame_with_results(snapshot["rgb"])
-                self.last_annotated = annotated.copy()
-                target = self._select_target(results, snapshot["rgb"].shape)
-                self.current_target = target
-                # 주행 중(WAIT_ARRIVAL)에는 트래킹 북키핑 생략하여 노이즈 방지 가능
-                if self.state != "WAIT_ARRIVAL":
-                    self._update_tracking_bookkeeping(target)
-
-            # 3. 상태별 로직 처리
-            if self.state == "WAIT_ARRIVAL":
-                self.stop_motion()
-            elif self.state == "SEARCH_PERSON":
-                self._handle_search_person(target)
-            elif self.state == "FRAME_PERSON":
-                self._handle_frame_person(target, snapshot)
-            elif self.state == "VERIFY_FRAME":
-                self._handle_verify_frame(target, snapshot)
-            elif self.state == "MEASURING":
-                self._handle_measuring(target, snapshot)
-            elif self.state == "RESULT_LOCKED":
-                self._handle_result_locked()
-            elif self.state == "WAIT_TTS_DONE":
-                self.stop_motion()
-            elif self.state == "SESSION_END":
-                self._publish_final_result()
-                self.reset_session()
-
-            # 4. 상태 및 영상 퍼블리시 (항상 수행)
-            self._publish_status()
-            if self.publish_annotated:
-                self._publish_annotated(annotated, snapshot.get("rgb_stamp"))
-
+            annotated, target = self._run_perception(snapshot)
+            self._dispatch_state_handler(target, snapshot)
+            self._publish_step_outputs(annotated, snapshot)
         except Exception as exc:
             self.get_logger().error(f"step failed: {exc}")
+
+    def _consume_abort_request(self) -> bool:
+        if not self.abort_requested:
+            return False
+
+        self.abort_requested = False
+        if self.state == "WAIT_ARRIVAL":
+            return False
+
+        self.get_logger().warn(f"[Abort] Current session aborted by nav timeout. state={self.state} -> WAIT_ARRIVAL")
+        self.reset_session()
+        return True
+
+    def _log_step_state(self) -> None:
+        now_t = time.time()
+        if not hasattr(self, "_last_state_log_t"):
+            self._last_state_log_t = 0.0
+        if (now_t - self._last_state_log_t) > 2.0:
+            self.get_logger().info(f"[Step] Current State: {self.state} | Person In View: {self.current_target is not None}")
+            self._last_state_log_t = now_t
+
+    def _run_perception(self, snapshot: Dict[str, Any]) -> Tuple[np.ndarray, Optional[Dict[str, Any]]]:
+        if self.state in ("WAIT_TTS_DONE", "SESSION_END"):
+            annotated = self.last_annotated if self.last_annotated is not None else snapshot["rgb"]
+            return annotated, None
+
+        annotated, results = self.engine.analyze_frame_with_results(snapshot["rgb"])
+        self.last_annotated = annotated.copy()
+        target = self._select_target(results, snapshot["rgb"].shape)
+        self.current_target = target
+        if self.state != "WAIT_ARRIVAL":
+            self._update_tracking_bookkeeping(target)
+        return annotated, target
+
+    def _dispatch_state_handler(self, target: Optional[Dict[str, Any]], snapshot: Dict[str, Any]) -> None:
+        if self.state == "WAIT_ARRIVAL":
+            self.stop_motion()
+        elif self.state == "SEARCH_PERSON":
+            self._handle_search_person(target)
+        elif self.state == "FRAME_PERSON":
+            self._handle_frame_person(target, snapshot)
+        elif self.state == "VERIFY_FRAME":
+            self._handle_verify_frame(target, snapshot)
+        elif self.state == "MEASURING":
+            self._handle_measuring(target, snapshot)
+        elif self.state == "RESULT_LOCKED":
+            self._handle_result_locked()
+        elif self.state == "WAIT_TTS_DONE":
+            self.stop_motion()
+        elif self.state == "SESSION_END":
+            self._publish_final_result()
+            self.reset_session()
+
+    def _publish_step_outputs(self, annotated: np.ndarray, snapshot: Dict[str, Any]) -> None:
+        self._publish_status()
+        if self.publish_annotated:
+            self._publish_annotated(annotated, snapshot.get("rgb_stamp"))
 
     # ------------------------------------------------------------------
     # State handlers
     # ------------------------------------------------------------------
+    def _enter_search_person(self, now: Optional[float] = None) -> None:
+        self.state = "SEARCH_PERSON"
+        if now is not None:
+            self.state_start_t = now
+
+    def _enter_verify_frame(self, now: float, forced: bool = False) -> None:
+        if forced:
+            self.framing_forced = True
+        self.stop_motion()
+        self.verify_ok_count = 0
+        self.state = "VERIFY_FRAME"
+        self.state_start_t = now
+
+    def _handle_missing_target_transition(
+        self,
+        now: float,
+        *,
+        reset_verify_count: bool = False,
+        update_search_state_time: bool = False,
+    ) -> bool:
+        if self._target_recently_seen(now):
+            self.stop_motion()
+            return True
+
+        if reset_verify_count:
+            self.verify_ok_count = 0
+
+        self._enter_search_person(now if update_search_state_time else None)
+        return True
+
+    def _get_logged_frame_action(
+        self,
+        state_name: str,
+        target: Dict[str, Any],
+        snapshot: Dict[str, Any],
+    ) -> str:
+        action = self._decide_frame_action(target, snapshot)
+        self._log_frame_action(state_name, action, target, snapshot)
+        return action
+
     def _handle_search_person(self, target: Optional[Dict[str, Any]]) -> None:
         now = time.time()
         if target is None:
@@ -360,54 +435,43 @@ class Robot6ControlNode(Node):
     def _handle_frame_person(self, target: Optional[Dict[str, Any]], snapshot: Dict[str, Any]) -> None:
         now = time.time()
         if target is None:
-            if self._target_recently_seen(now):
-                self.stop_motion()
-                return
-            self.state = "SEARCH_PERSON"
+            self._handle_missing_target_transition(now)
             return
 
-        # 프레이밍 타임아웃 (10초 이상 조준 실패 시 강제 진행)
         if (now - self.state_start_t) > 10.0:
             self.get_logger().warn("Framing timeout reached (10s). Forcing transition to VERIFY_FRAME with framing_forced=True.")
-            self.framing_forced = True
-            self.stop_motion()
-            self.verify_ok_count = 0
-            self.state = "VERIFY_FRAME"
-            self.state_start_t = now
+            self._enter_verify_frame(now, forced=True)
             return
 
-        action = self._decide_frame_action(target, snapshot)
+        action = self._get_logged_frame_action("FRAME_PERSON", target, snapshot)
         if action == "SEARCH":
             if self._target_recently_seen(now):
                 self.stop_motion()
             else:
-                self.state = "SEARCH_PERSON"
-                self.state_start_t = now
+                self._enter_search_person(now)
         elif action == "YAW_ALIGN":
             self.cmd_vel_pub.publish(self._make_yaw_cmd(target, snapshot["rgb"].shape[1]))
         elif action == "BACKOFF":
             self.cmd_vel_pub.publish(self._make_backoff_cmd())
         else:
-            self.stop_motion()
-            self.verify_ok_count = 0
-            self.state = "VERIFY_FRAME"
-            self.state_start_t = now
+            self._enter_verify_frame(now)
+
+    def _should_reframe_during_verify_or_measure(self, action: str) -> bool:
+        # framing_forced는 SEARCH만 우회하고, 실제 재정렬(YAW_ALIGN/BACKOFF) 필요 시에는 측정을 강행하지 않음
+        return action in ("YAW_ALIGN", "BACKOFF", "SEARCH")
 
     def _handle_verify_frame(self, target: Optional[Dict[str, Any]], snapshot: Dict[str, Any]) -> None:
         now = time.time()
         if target is None:
-            if self._target_recently_seen(now):
-                self.stop_motion()
-                return
-            self.verify_ok_count = 0
-            self.state = "SEARCH_PERSON"
+            self._handle_missing_target_transition(now, reset_verify_count=True)
             return
 
-        if not self.framing_forced and self._decide_frame_action(target, snapshot) != "HOLD":
+        action = self._get_logged_frame_action("VERIFY_FRAME", target, snapshot)
+        if self._should_reframe_during_verify_or_measure(action):
             self.verify_ok_count = 0
-            # FRAME_PERSON으로 돌아가더라도 timer를 reset하지 않음 (전체 framing timeout 10s 유지)
             self.state = "FRAME_PERSON"
             return
+
         self.verify_ok_count += 1
         self.stop_motion()
         if self.verify_ok_count >= self.VERIFY_N:
@@ -419,15 +483,11 @@ class Robot6ControlNode(Node):
     def _handle_measuring(self, target: Optional[Dict[str, Any]], snapshot: Dict[str, Any]) -> None:
         now = time.time()
         if target is None:
-            if self._target_recently_seen(now):
-                self.stop_motion()
-                return
-            self.state = "SEARCH_PERSON"
-            self.state_start_t = now
+            self._handle_missing_target_transition(now, update_search_state_time=True)
             return
 
-        if not self.framing_forced and self._decide_frame_action(target, snapshot) != "HOLD":
-            # MEASURING 중이라도 Jitter 발생 시 돌아가되 timer reset 안함
+        action = self._get_logged_frame_action("MEASURING", target, snapshot)
+        if self._should_reframe_during_verify_or_measure(action):
             self.state = "FRAME_PERSON"
             return
 
@@ -455,10 +515,9 @@ class Robot6ControlNode(Node):
             self.get_logger().info(f"Result locked: Dominant Observation = {obs_majority}")
 
         if not self.tts_requested:
-            # STT Node expects a simple uppercase status string (e.g. "CRITICAL")
-            # fallback to "NORMAL" only if data is truly missing
+            # Defensive check for result_snapshot structure
             overall = self.result_snapshot.get("overall", {})
-            peak = overall.get("emergency_peak")
+            peak = overall.get("emergency_peak", "NORMAL")
             status_to_send = str(peak if peak else "NORMAL").upper()
             
             self.get_logger().info(f"Requesting TTS announcement with status: {status_to_send}")
@@ -507,8 +566,18 @@ class Robot6ControlNode(Node):
         if msg is None:
             return None
         try:
-            # Ignition Gazebo bridges depth as 32FC1 (meters)
-            return self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
+            encoding = msg.encoding
+            if encoding == "32FC1":
+                # Gazebo/Simulator: depth already in meters
+                return self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
+            elif encoding in ("16UC1", "mono16"):
+                # Real Hardware (OAK-D): depth in mm, convert to meters
+                depth_mm = self.bridge.imgmsg_to_cv2(msg, desired_encoding="16UC1")
+                return depth_mm.astype(np.float32) / 1000.0
+            else:
+                # Fallback: attempt direct conversion
+                self.get_logger().warn(f"Unknown depth encoding: {encoding}. Attempting 32FC1 conversion.")
+                return self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
         except Exception as exc:
             self.get_logger().error(f"decode_depth failed: {exc}")
             return None
@@ -566,27 +635,47 @@ class Robot6ControlNode(Node):
     # ------------------------------------------------------------------
     # Framing control
     # ------------------------------------------------------------------
+    def _bbox_center(self, target: Dict[str, Any]) -> Tuple[float, float]:
+        x1, y1, x2, y2 = target["bbox"]
+        return 0.5 * (x1 + x2), 0.5 * (y1 + y2)
+
+    def _frame_center_errors(self, target: Dict[str, Any], snapshot: Dict[str, Any]) -> Tuple[float, float]:
+        frame_h, frame_w = snapshot["rgb"].shape[:2]
+        cx_box, cy_box = self._bbox_center(target)
+        err_x = cx_box - (0.5 * frame_w)
+        err_y = cy_box - (0.5 * frame_h)
+        return err_x, err_y
+
+    def _log_frame_action(self, state_name: str, action: str, target: Dict[str, Any], snapshot: Dict[str, Any]) -> None:
+        err_x, err_y = self._frame_center_errors(target, snapshot)
+        key = (state_name, action, int(round(err_x)), int(round(err_y)))
+        if key == self.last_action_log_key:
+            return
+        self.last_action_log_key = key
+        self.get_logger().info(
+            f"[{state_name}] action={action} err_x={err_x:.1f} err_y={err_y:.1f}"
+        )
+
     def _decide_frame_action(self, target: Dict[str, Any], snapshot: Dict[str, Any]) -> str:
-        obs = str(target.get("observation", "LOW_CONF"))
-        if obs == "LOW_CONF":
+        # LOW_CONF라도 bbox가 유효하면 SEARCH로 넘기지 않고 화면 중심 정렬을 먼저 시도한다.
+        # SEARCH는 타겟 자체가 없거나 bbox가 비정상일 때만 사용한다.
+        bbox = target.get("bbox")
+        if bbox is None or len(bbox) != 4:
             return "SEARCH"
 
         frame_h, frame_w = snapshot["rgb"].shape[:2]
         x1, y1, x2, y2 = target["bbox"]
         bw = max(1.0, x2 - x1)
         bh = max(1.0, y2 - y1)
-        cx_box = 0.5 * (x1 + x2)
-        err_x = cx_box - (0.5 * frame_w)
-
-        if abs(err_x) > self.CENTER_TOL_PX:
-            return "YAW_ALIGN"
+        err_x, err_y = self._frame_center_errors(target, snapshot)
 
         w_ratio = bw / frame_w
         h_ratio = bh / frame_h
         touch_left = x1 <= self.EDGE_MARGIN_PX
         touch_right = x2 >= frame_w - self.EDGE_MARGIN_PX
-        touch_top = y1 <= self.EDGE_MARGIN_PX
-        touch_bottom = y2 >= frame_h - self.EDGE_MARGIN_PX
+        touch_top = y1 <= self.VERTICAL_EDGE_MARGIN_PX
+        touch_bottom = y2 >= frame_h - self.VERTICAL_EDGE_MARGIN_PX
+        off_center_y = abs(err_y) > self.CENTER_TOL_Y_PX
 
         depth_m = self._estimate_target_depth(target, snapshot)
         too_close_by_box = (
@@ -594,21 +683,23 @@ class Robot6ControlNode(Node):
             or w_ratio >= self.BACKOFF_W_RATIO
             or touch_top
             or touch_bottom
+            or off_center_y
         )
         too_close_by_depth = depth_m is not None and depth_m < self.DEPTH_TOO_CLOSE_M
 
-        # FULL_BODY도 정말 가깝게 붙었으면 backoff 후보로 인정
+        # 좌우가 크게 벗어나면 먼저 화면 중심 정렬을 수행한다.
+        if abs(err_x) > self.CENTER_TOL_PX or touch_left or touch_right:
+            return "YAW_ALIGN"
+
+        # 좌우 정렬이 된 뒤에도 너무 가깝거나 상/하단이 과하게 치우치면 뒤로 빠진다.
         if too_close_by_box or too_close_by_depth:
             return "BACKOFF"
-
-        if touch_left or touch_right:
-            return "YAW_ALIGN"
 
         return "HOLD"
 
     def _make_yaw_cmd(self, target: Dict[str, Any], frame_w: int) -> Twist:
-        x1, _, x2, _ = target["bbox"]
-        err_x = 0.5 * (x1 + x2) - (0.5 * frame_w)
+        cx_box, _ = self._bbox_center(target)
+        err_x = cx_box - (0.5 * frame_w)
 
         twist = Twist()
         yaw = -self.YAW_KP * err_x
@@ -687,7 +778,8 @@ class Robot6ControlNode(Node):
         y1 = max(0, y - r)
         y2 = min(h, y + r + 1)
 
-        patch = depth_img[y1:y2, x1:x2].astype(np.float32) / 1000.0
+        patch = depth_img[y1:y2, x1:x2].astype(np.float32)
+        # Note: depth_img is already normalized to meters in _decode_depth
         patch += self.DEPTH_OFFSET_M
         patch[patch <= 0.0] = np.nan
 
@@ -763,7 +855,7 @@ class Robot6ControlNode(Node):
     def _estimate_victim_position(self, target: Dict[str, Any], snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         depth = snapshot.get("depth")
         K = snapshot.get("K")
-        frame_id = snapshot.get("frame_id")
+        frame_id = snapshot.get("depth_frame_id")
         if depth is None or K is None or frame_id is None:
             return None
 
@@ -790,8 +882,9 @@ class Robot6ControlNode(Node):
         if fx == 0.0 or fy == 0.0:
             return None
 
-        X = (float(u) - cx) * z / fx
-        Y = (float(v) - cy) * z / fy
+        # 3D 투영 시 Depth 카메라의 Intrinsics(K)를 사용하므로 스케일링된 u_scaled, v_scaled를 적용
+        X = (float(u_scaled) - cx) * z / fx
+        Y = (float(v_scaled) - cy) * z / fy
 
         pt_camera = PointStamped()
         pt_camera.header.stamp = self.get_clock().now().to_msg()
@@ -1051,6 +1144,47 @@ class Robot6ControlNode(Node):
     def _make_session_id(self) -> str:
         return f"{self.robot_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
+    def _reset_session_flags(self) -> None:
+        self.state = "WAIT_ARRIVAL"
+        self.session_id = None
+        self.session_start_t = None
+        self.session_start_iso = None
+        self.measure_start_t = None
+        self.measure_end_t = None
+        self.session_active = False
+        self.result_locked = False
+        self.tts_requested = False
+        self.tts_done = False
+        self.framing_forced = False
+        self.state_start_t = time.time()
+        self.abort_requested = False
+
+    def _reset_tracking_state(self) -> None:
+        self.current_track_id = None
+        self.current_target = None
+        self.last_valid_target = None
+        self.last_seen_t = 0.0
+        self.last_target_x = 320
+        self.verify_ok_count = 0
+        self.stable_frame_count = 0
+        self.low_conf_count = 0
+        self.no_person_count = 0
+        self.last_action_log_key = None
+
+    def _reset_measurement_buffers(self) -> None:
+        self.bucket_overall.clear()
+        self.bucket_full_body.clear()
+        self.bucket_upper_body.clear()
+        self.bucket_partial.clear()
+        self.victim_map_points.clear()
+        self.victim_method_hist.clear()
+        self.valid_position_samples = 0
+
+    def _reset_result_cache(self) -> None:
+        self.result_snapshot = None
+        self.bridge = CvBridge()
+        self.last_annotated = None
+
     def reset_session(self) -> None:
         if hasattr(self.engine, "reset"):
             try:
@@ -1059,48 +1193,13 @@ class Robot6ControlNode(Node):
                 self.get_logger().warn(f"engine.reset() failed: {exc}")
 
         self.stop_motion()
+        self._reset_session_flags()
+        self._reset_tracking_state()
+        self._reset_measurement_buffers()
+        self._reset_result_cache()
 
-        self.state = "WAIT_ARRIVAL"
-        self.session_id = None
-        self.session_start_t = None
-        self.session_start_iso = None
-        self.measure_start_t = None
-        self.measure_end_t = None
-
-        self.session_active = False
-        self.result_locked = False
-        self.tts_requested = False
-        self.tts_done = False
-        self.framing_forced = False
-        self.state_start_t = time.time()
-        
         self.get_logger().info('[Reset] Session has been reset. Ready for next target.')
-
         self.get_logger().info("Session reset. Waiting for next target arrival...")
-
-        self.current_track_id = None
-        self.current_target = None
-        self.last_valid_target = None
-        self.last_seen_t = 0.0
-        self.last_target_x = 320
-
-        self.verify_ok_count = 0
-        self.stable_frame_count = 0
-        self.low_conf_count = 0
-        self.no_person_count = 0
-
-        self.bucket_overall.clear()
-        self.bucket_full_body.clear()
-        self.bucket_upper_body.clear()
-        self.bucket_partial.clear()
-
-        self.victim_map_points.clear()
-        self.victim_method_hist.clear()
-        self.valid_position_samples = 0
-
-        self.result_snapshot = None
-        self.bridge = CvBridge()
-        self.last_annotated = None
 
 
 # ----------------------------------------------------------------------
