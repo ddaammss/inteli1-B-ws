@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SRD 통합 관제 센터</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="web_ui.css">
+</head>
+<body>
+
+  <!-- ── Header ──────────────────────────────────────────────
+       좌측: 시스템 타이틀 + ROS 연결 상태 배지
+       우측: ROS Bridge 연결 설정 / VIDEO SERVER URL / 로그아웃 버튼
+  ─────────────────────────────────────────────────────────── -->
+  <header class="header">
+    <div class="header-left">
+      <div class="header-dot"></div>
+      <div>
+        <div class="header-title">
+          통합 관제 센터
+        </div>
+        <div class="header-badges">
+          <!-- id="ros-badge": ROS 연결 상태에 따라 JS에서 텍스트/클래스 변경 -->
+          <span id="ros-badge" class="badge badge-offline">ROS 오프라인</span>
+          <span class="badge badge-gray">ACTIVE SURVEILLANCE PIPELINE</span>
+        </div>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="header-config">
+        <!-- ROS Bridge: WebSocket URL 입력 후 연결 버튼 클릭 → connectRosBridge() -->
+        <div class="header-config-group">
+          <span class="hcfg-label">ROS BRIDGE</span>
+          <div class="hcfg-row">
+            <input id="ros-url" class="header-input" type="text" value="ws://localhost:9090" />
+            <button class="btn-connect" onclick="connectRosBridge()">연결</button>
+            <!-- ros-status: 연결 중 / 연결됨 / 실패 텍스트 표시 -->
+            <div id="ros-status" class="header-ros-status"></div>
+          </div>
+        </div>
+        <div class="hcfg-divider"></div>
+        <!-- VIDEO SERVER: web_video_server 주소 (카메라 스트림 URL 기준) -->
+        <div class="header-config-group">
+          <span class="hcfg-label">VIDEO SERVER</span>
+          <input id="video-url" class="header-input" type="text" value="http://localhost:8080" />
+        </div>
+      </div>
+      <!-- 로그아웃: Firebase signOut 후 login.html로 이동 -->
+      <button class="btn-logout" onclick="doLogout()">로그아웃</button>
+    </div>
+  </header>
+  <main class="main-grid">
+
+    <!-- ── 4.3 모니터링 및 데이터 저장: 토픽 수신 → 화면 출력 흐름 ────────────
+         ROS Bridge (WebSocket ws://localhost:9090) 구독 토픽 목록:
+           • /robot5/map                (nav_msgs/OccupancyGrid)         → HAZARD MAP 캔버스 렌더링
+           • /robot5/battery_state      (sensor_msgs/BatteryState)       → Robot A 배터리 표시
+           • /robot6/battery_state      (sensor_msgs/BatteryState)       → Robot B 배터리 표시
+           • /robot5/dock_status        (irobot_create_msgs/DockStatus)  → Robot A 도킹 상태 표시
+           • /robot6/dock_status        (irobot_create_msgs/DockStatus)  → Robot B 도킹 상태 표시
+           • /robot5/odom              (nav_msgs/Odometry)               → Robot A 속도 (linear.x) 표시
+           • /robot6/odom              (nav_msgs/Odometry)               → Robot B 속도 (linear.x) 표시
+
+         web-video-server (http://localhost:8080) 스트리밍 토픽:
+           • /robot1/oakd/rgb/image_raw/compressed  → CAM 02: ROBOT A MJPEG 스트리밍
+           • /robot3/repub/compressed               → CAM 03: ROBOT B MJPEG 스트리밍
+           • (추가 카메라 토픽)                      → CAM 04 / CAM 05 오버레이 스트리밍
+
+         토픽 수신 → 화면 출력 흐름:
+           ROS Bridge      : 토픽 메시지를 WebSocket으로 수신 → JS 콜백에서 DOM 업데이트
+           web-video-server: 카메라 토픽을 MJPEG HTTP 스트림으로 변환 → <img src> 직접 연결
+           배터리 콜백     : msg.percentage (0~1) → % 변환 → 배터리 바 / 텍스트 실시간 반영
+    ──────────────────────────────────────────────────────────────────────── -->
+
+    <!-- HAZARD MAP ─────────────────────────────────────────
+         /robot5/map (nav_msgs/OccupancyGrid) 수신 시 Canvas에 렌더링
+         renderMap()이 canvas.width/height를 OccupancyGrid 해상도로 설정
+    ──────────────────────────────────────────────────────── -->
+    <section class="card map-card">
+      <div class="card-header">
+        <div class="card-title">
+          <span class="status-dot dot-blue"></span>
+          HAZARD MAP
+        </div>
+      </div>
+      <div class="map-area" id="map-container">
+        <!-- map-placeholder: 맵 수신 전 표시, 수신 후 JS에서 숨김 -->
+        <span class="empty-text" id="map-placeholder">지도 수신 대기 중...</span>
+        <!-- map-canvas: OccupancyGrid 픽셀 데이터를 직접 그리는 캔버스 -->
+        <canvas id="map-canvas"></canvas>
+      </div>
+    </section>
+
+    <!-- LIVE VISION ────────────────────────────────────────
+         web_video_server를 통해 카메라 영상 스트리밍
+         connectCam(num) 호출 시 img.src에 스트림 URL 설정
+         2x2 그리드: Robot A / Robot B / CAM01 / CAM02
+    ──────────────────────────────────────────────────────── -->
+    <section class="card vision-card">
+      <div class="card-header">
+        <div class="card-title">
+          <span class="status-dot dot-purple"></span>
+          LIVE VISION
+        </div>
+      </div>
+
+      <!-- 카메라 레이아웃: 2x2 그리드 -->
+      <div class="camera-layout">
+        <!-- 1행: Robot A / Robot B -->
+        <div class="cam-row">
+          <div class="cam-col">
+            <div class="cam-slot" id="cam-slot-02">
+              <span class="cam-label">CAM 02: ROBOT A</span>
+              <img id="cam-img-02" alt="" />
+              <span class="cam-empty">WAITING FOR STREAM</span>
+              <span id="cam-status-02" class="cam-status"></span>
+            </div>
+            <button class="btn-cam" onclick="connectCam(0)">
+              <span class="btn-cam-dot" id="cam-dot-02"></span>
+              Robot A 연결
+            </button>
+          </div>
+          <div class="cam-col">
+            <div class="cam-slot" id="cam-slot-03">
+              <span class="cam-label">CAM 03: ROBOT B</span>
+              <img id="cam-img-03" alt="" />
+              <span class="cam-empty">WAITING FOR STREAM</span>
+              <span id="cam-status-03" class="cam-status"></span>
+            </div>
+            <button class="btn-cam" onclick="connectCam(1)">
+              <span class="btn-cam-dot" id="cam-dot-03"></span>
+              Robot B 연결
+            </button>
+          </div>
+        </div>
+        <!-- 2행: CAM01 Overlay / CAM02 Overlay -->
+        <div class="cam-row">
+          <div class="cam-col">
+            <div class="cam-slot" id="cam-slot-04">
+              <span class="cam-label">CAM 04: CAM01 OVERLAY</span>
+              <img id="cam-img-04" alt="" />
+              <span class="cam-empty">WAITING FOR STREAM</span>
+              <span id="cam-status-04" class="cam-status"></span>
+            </div>
+            <button class="btn-cam" onclick="connectCam(2)">
+              <span class="btn-cam-dot" id="cam-dot-04"></span>
+              CAM01 연결
+            </button>
+          </div>
+          <div class="cam-col">
+            <div class="cam-slot" id="cam-slot-05">
+              <span class="cam-label">CAM 05: CAM02 OVERLAY</span>
+              <img id="cam-img-05" alt="" />
+              <span class="cam-empty">WAITING FOR STREAM</span>
+              <span id="cam-status-05" class="cam-status"></span>
+            </div>
+            <button class="btn-cam" onclick="connectCam(3)">
+              <span class="btn-cam-dot" id="cam-dot-05"></span>
+              CAM02 연결
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- INCIDENT LOG ────────────────────────────────────────
+         addLog(message, type) 호출 시 항목 추가 (최대 50개)
+         type: 'danger' → 헤더 ALERTS 카운터 증가
+    ──────────────────────────────────────────────────────── -->
+    <section class="card log-card">
+      <div class="card-header">
+        <div class="card-title">INCIDENT LOG</div>
+        <button class="btn-ghost-sm" onclick="clearLog()">초기화</button>
+      </div>
+      <div class="log-list" id="incident-log">
+        <span class="empty-text-sm">대기 중...</span>
+      </div>
+    </section>
+
+    <!-- ROBOT STATUS ────────────────────────────────────────
+         ROS Bridge 구독 토픽:
+           /robotN/battery_state → updateBattery()
+           /robotN/dock_status   → updateDock()
+           /robotN/odom          → updateOdom()
+    ──────────────────────────────────────────────────────── -->
+    <section class="card robot-status-card">
+      <div class="card-header">
+        <div class="card-title">ROBOT STATUS</div>
+      </div>
+      <div class="robot-status-body">
+        <!-- Robot A (robot5) -->
+        <div class="robot-status-item">
+          <div class="robot-status-label">
+            <span>Robot A (robot5)</span>
+            <!-- battery-pct: 퍼센트 텍스트 -->
+            <span id="battery-pct-5">-- %</span>
+          </div>
+          <!-- battery-bar-fill: width%로 배터리 잔량 시각화, low/mid 클래스로 색상 변경 -->
+          <div class="battery-bar-bg">
+            <div class="battery-bar-fill" id="battery-bar-5"></div>
+          </div>
+          <div class="robot-meta">
+            <span class="meta-item" id="battery-info-5">--V</span>
+            <span class="meta-sep">|</span>
+            <!-- dock-status: '도킹 중' / '주행 중' -->
+            <span class="meta-item dock-badge" id="dock-status-5">대기 중</span>
+            <span class="meta-sep">|</span>
+            <!-- odom-speed: linear.x 절댓값 (m/s) -->
+            <span class="meta-item" id="odom-speed-5">-- m/s</span>
+          </div>
+        </div>
+        <!-- Robot B (robot6) -->
+        <div class="robot-status-item">
+          <div class="robot-status-label">
+            <span>Robot B (robot6)</span>
+            <span id="battery-pct-6">-- %</span>
+          </div>
+          <div class="battery-bar-bg">
+            <div class="battery-bar-fill" id="battery-bar-6"></div>
+          </div>
+          <div class="robot-meta">
+            <span class="meta-item" id="battery-info-6">--V</span>
+            <span class="meta-sep">|</span>
+            <span class="meta-item dock-badge" id="dock-status-6">대기 중</span>
+            <span class="meta-sep">|</span>
+            <span class="meta-item" id="odom-speed-6">-- m/s</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Firebase SDK (순서 중요: app → auth → database) -->
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-auth.js"></script>
+  <!-- roslibjs: ROS Bridge WebSocket 통신 라이브러리 -->
+  <script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
+
+  <script src="web_ui.js"></script>
+</body>
+</html>

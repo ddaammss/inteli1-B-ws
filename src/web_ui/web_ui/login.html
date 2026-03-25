@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>통합 관제 센터 · 로그인</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: #0f172a;
+      color: #f1f5f9;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .login-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 48px 40px;
+      width: 100%;
+      max-width: 400px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+    }
+
+    .login-header {
+      text-align: center;
+      margin-bottom: 36px;
+    }
+
+    .login-dot {
+      width: 10px;
+      height: 10px;
+      background: #3b82f6;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 8px;
+      box-shadow: 0 0 8px #3b82f6;
+    }
+
+    .login-title {
+      font-size: 20px;
+      font-weight: 700;
+      color: #f1f5f9;
+      letter-spacing: 0.05em;
+    }
+
+    .login-sub {
+      font-size: 12px;
+      color: #64748b;
+      margin-top: 6px;
+      letter-spacing: 0.08em;
+    }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    .form-label {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      color: #94a3b8;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+    }
+
+    .form-input {
+      width: 100%;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #f1f5f9;
+      font-family: 'Inter', sans-serif;
+      font-size: 14px;
+      padding: 10px 14px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    .form-input:focus {
+      border-color: #3b82f6;
+    }
+
+    .form-input::placeholder {
+      color: #475569;
+    }
+
+    .btn-login {
+      width: 100%;
+      background: #3b82f6;
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      font-family: 'Inter', sans-serif;
+      font-size: 14px;
+      font-weight: 600;
+      padding: 12px;
+      cursor: pointer;
+      margin-top: 8px;
+      letter-spacing: 0.04em;
+      transition: background 0.15s;
+    }
+
+    .btn-login:hover { background: #2563eb; }
+    .btn-login:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+
+    .error-msg {
+      display: none;
+      background: rgba(220, 38, 38, 0.12);
+      border: 1px solid rgba(220, 38, 38, 0.3);
+      border-radius: 8px;
+      color: #f87171;
+      font-size: 13px;
+      padding: 10px 14px;
+      margin-top: 14px;
+      text-align: center;
+    }
+
+    .error-msg.visible { display: block; }
+  </style>
+</head>
+<body>
+
+  <div class="login-card">
+    <div class="login-header">
+      <div>
+        <span class="login-dot"></span>
+        <span class="login-title">통합 관제 센터</span>
+      </div>
+      <div class="login-sub">SEARCH & RESCUE DASHBOARD</div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="input-email">ID (이메일)</label>
+      <input id="input-email" class="form-input" type="email" placeholder="example@email.com" />
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="input-pw">PASSWORD</label>
+      <input id="input-pw" class="form-input" type="password" placeholder="비밀번호 입력" />
+    </div>
+
+    <button id="btn-login" class="btn-login" onclick="doLogin()">로그인</button>
+
+    <div id="error-msg" class="error-msg">ID 또는 비밀번호를 다시 입력해 주세요.</div>
+  </div>
+
+  <!-- Firebase SDK -->
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-auth.js"></script>
+
+  <script>
+    const firebaseConfig = {
+      apiKey: "AIzaSyBoWy1kWi5lwMnRVs2MeOS96udqWhe-MJU",
+      authDomain: "rokey-1f8f3.firebaseapp.com",
+      databaseURL: "https://rokey-1f8f3-default-rtdb.asia-southeast1.firebasedatabase.app",
+      projectId: "rokey-1f8f3",
+      storageBucket: "rokey-1f8f3.firebasestorage.app",
+      messagingSenderId: "405786322615",
+      appId: "1:405786322615:web:b75b9bcd4207a4eda60f32"
+    };
+
+    firebase.initializeApp(firebaseConfig);
+    const auth = firebase.auth();
+
+    // 이미 로그인된 상태면 바로 이동
+    auth.onAuthStateChanged(user => {
+      if (user) window.location.href = 'web_ui.html';
+    });
+
+    function doLogin() {
+      const email  = document.getElementById('input-email').value.trim();
+      const pw     = document.getElementById('input-pw').value;
+      const btn    = document.getElementById('btn-login');
+      const errEl  = document.getElementById('error-msg');
+
+      errEl.classList.remove('visible');
+
+      if (!email || !pw) {
+        errEl.textContent = 'ID와 비밀번호를 모두 입력해 주세요.';
+        errEl.classList.add('visible');
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = '로그인 중...';
+
+      auth.signInWithEmailAndPassword(email, pw)
+        .then(() => {
+          window.location.href = 'web_ui.html';
+        })
+        .catch(() => {
+          errEl.textContent = 'ID 또는 비밀번호를 다시 입력해 주세요.';
+          errEl.classList.add('visible');
+          btn.disabled = false;
+          btn.textContent = '로그인';
+        });
+    }
+
+    // Enter 키로 로그인
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Enter') doLogin();
+    });
+  </script>
+
+</body>
+</html>

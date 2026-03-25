@@ -1,352 +1,191 @@
-# 재난구조 로봇(RR:Rescue Robot)
+# rokey_ws
 
-## 1. 프로젝트 개요
+ROS2 기반 구조/감지 워크스페이스입니다. 현재 워크스페이스는 아래 3개 패키지로 구성됩니다.
 
-본 프로젝트는 **2대의 TurtleBot4(`robot5`, `robot6`)와 4대의 PC**를 이용하여,
-미지 환경에서 요구조자를 탐지하고 구조 대응을 수행하는 **다중 로봇 협업형 구조 지원 시스템**을 구현하는 것을 목표로 한다.
+- `camera_system`: 카메라 입력, 사람/로봇 감지, 오버레이, 붕괴 감지
+- `robot5_person_search`: robot5 탐색 및 사람 검출 이벤트 발행
+- `rescue_bot`: robot6 구조 미션 제어, 비전 분석, 내비게이션, STT/TTS, 웹 UI
 
-전체 시나리오는 다음과 같다.
-
-1. `robot5`가 먼저 미지 환경을 주행하며 **SLAM 기반 맵핑**을 수행한다.
-2. `robot5`가 맵 생성을 완료하고, 저장된 맵 또는 안정화된 `map` 기준으로 localization 가능한 상태를 만든다.
-3. 이후 `robot5`가 RGB/Depth 카메라와 YOLO를 이용해 **요구조자를 탐지**하고, 해당 위치를 **완성된 맵 좌표계 기준으로 추정**한다.
-4. 탐지된 요구조자 위치를 `robot6`에게 전달한다.
-5. `robot6`는 전달받은 좌표로 이동한 뒤, **YOLO-Pose 기반 상태 분석**을 수행한다.
-6. `robot6`는 **STT/TTS 기반 음성 상호작용**을 통해 요구조자와 간단한 의사소통을 수행하고, 구호 물품을 제공한다.
-7. 전체 과정은 메인 PC의 **대시보드**에서 통합 모니터링한다.
-
-이 시스템은 단순 객체 탐지를 넘어, **SLAM, 다중 로봇 협업, 사람 상태 인식, 음성 인터랙션, 관제 대시보드**를 하나의 구조 시나리오로 연결하는 것을 목표로 한다.
-
----
-
-## 2. 시스템 구성
-
-### 2.1 하드웨어 구성
-
-- **TurtleBot4 2대**
-  - `robot5`
-  - `robot6`
-- **웹캠 2대**
-- **PC 4대**
-  - `robot5` 담당 PC
-  - `robot6` 담당 PC
-  - 메인 대시보드 PC
-  - 웹캠 입력 및 토픽 퍼블리시 PC
-
-### 2.2 네트워크 구성
-
-- 모든 장비는 **같은 Wi-Fi**에 연결
-- 동일한 **ROS 2 Domain ID** 사용
-- 멀티머신 ROS 2 통신 환경 구성
-- 권장 사항
-  - 고정 IP 사용
-  - 시간 동기화(NTP/chrony)
-  - 영상 토픽은 필요 시 압축 전송
-  - rosbridge는 메인 PC에서 운영
-
----
-
-## 3. 장비별 역할 분담
-
-| 장비 | 역할 |
-|---|---|
-| `robot5` + 담당 PC | SLAM 기반 맵핑, 맵 저장/안정화, 저장 맵 기준 localization, 요구조자 1차 탐지, 요구조자 위치 추정 및 전송 |
-| `robot6` + 담당 PC | 전달받은 위치로 이동, 요구조자 정밀 상태 분석, STT/TTS 상호작용, 구호 물품 제공 |
-| 메인 PC | 대시보드 운영, 맵/이벤트/탐지 상태/로봇 상태 통합 시각화 |
-| 웹캠 PC | 웹캠 2대 영상 수집, ROS 이미지 토픽 publish, 외부 시점 제공 |
-
----
-
-## 4. 전체 시나리오
-
-### 단계 1. `robot5`의 선행 탐색 및 맵 생성
-- `robot5`가 미지 환경을 자율 주행한다.
-- SLAM을 통해 환경 지도를 생성한다.
-- 생성된 맵을 저장하거나, 더 이상 크게 변하지 않는 안정화된 상태로 만든다.
-
-### 단계 2. 저장 맵 기준 재로컬라이제이션
-- `robot5`는 완성된 맵 기준으로 자신의 위치를 다시 안정적으로 추정한다.
-- 이후 탐지 결과는 진행 중인 SLAM 좌표가 아니라, **완성된 `map` 기준 좌표계**에 기록된다.
-
-### 단계 3. 요구조자 탐지 및 위치 추정
-- `robot5`가 RGB/Depth 카메라와 YOLO를 이용해 요구조자를 탐지한다.
-- Depth 정보와 TF 변환을 이용하여, 요구조자의 위치를 **이미지 좌표가 아닌 완성된 `map` 좌표계 기준 위치**로 변환한다.
-
-### 단계 4. 구조 임무 전달
-- `robot5`는 탐지된 요구조자의 위치를 `robot6`에게 전달한다.
-- 전달 방식은 토픽, 서비스, 액션, 또는 중앙 DB/서버 연동 중 하나로 설계할 수 있다.
-
-### 단계 5. `robot6`의 현장 접근
-- `robot6`는 전달받은 좌표를 목표로 설정한다.
-- `robot5`가 생성한 맵 또는 공유된 공통 맵을 기반으로 localization 후 목표 위치까지 이동한다.
-
-### 단계 6. 요구조자 상태 정밀 분석
-- `robot6`는 YOLO-Pose를 이용해 요구조자의 자세를 분석한다.
-- 필요 시 표정, 움직임, lying 상태 등을 종합하여 요구조자의 상태를 분류한다.
-
-### 단계 7. 음성 상호작용
-- STT를 이용해 요구조자의 발화를 인식한다.
-- TTS를 이용해 질문, 안내, 응답을 수행한다.
-- 예시:
-  - “괜찮으세요?”
-  - “움직일 수 있으신가요?”
-  - “구호 물품을 제공하겠습니다.”
-
-### 단계 8. 구호 물품 제공
-- 로봇 팔이 없으므로, 실제 구현은 “직접 손에 쥐여주는 전달”보다는 아래 방식에 가깝다.
-  - 상단 적재함/트레이 제공
-  - 특정 위치에 물품 놓기
-  - 음성 안내를 통한 사용 유도
-
----
-
-## 5. 핵심 기술 요소
-
-### 5.1 공간 인식 및 자율주행
-- SLAM
-- `map` 생성 및 공유
-- localization
-- goal navigation
-
-### 5.2 요구조자 탐지 및 상태 판단
-- 저장 맵 기준 요구조자 탐지 및 좌표화
-- YOLO 기반 요구조자 탐지
-- YOLO-Pose 기반 자세 분석
-- Motion / posture / facial expression 기반 상태 추정
-
-### 5.3 다중 로봇 협업
-- `robot5` → `robot6` 임무 전달
-- 공통 좌표계 기반 목표 위치 공유
-- 역할 분업
-  - `robot5`: 탐색/발견
-  - `robot6`: 접근/판단/대응
-
-### 5.4 음성 인터랙션
-- STT 기반 음성 인식
-- TTS 기반 안내/응답
-- 단순 구조 대화 흐름 관리
-
-### 5.5 관제 시스템
-- rosbridge 기반 웹 대시보드
-- 맵 시각화
-- 탐지 상태 및 이벤트 로그 표시
-- 외부 웹캠 연동
-
----
-
-## 6. 전체 아키텍처 개념도
+## Workspace Layout
 
 ```text
-[robot5 PC]
-  ├─ SLAM
-  ├─ 탐색 주행
-  ├─ 맵 저장/안정화
-  ├─ localization
-  ├─ YOLO 요구조자 탐지
-  └─ victim pose 추정
-          │
-          ▼
-   [요구조자 위치/임무 전달]
-          │
-          ▼
-[robot6 PC]
-  ├─ localization / navigation
-  ├─ goal 이동
-  ├─ YOLO-Pose 상태 분석
-  ├─ STT / TTS
-  └─ 구호 물품 제공
-          │
-          ├───────────────┐
-          ▼               ▼
-    [DB / 로그]      [메인 PC 대시보드]
-                           ├─ map 시각화
-                           ├─ 탐지 요약
-                           ├─ 이벤트 로그
-                           └─ 외부 웹캠 표시
-
-[웹캠 PC]
-  ├─ webcam 1 capture
-  └─ webcam 2 capture
-          │
-          ▼
-     ROS image topics
+/home/gom/rokey_ws
+├── requirements.txt
+└── src
+    ├── camera_system
+    ├── rescue_bot
+    └── robot5_person_search
 ```
 
----
+## Environment
 
-## 7. ROS 2 권장 노드 구성
+이 워크스페이스는 현재 아래 환경을 기준으로 사용하는 것을 전제로 합니다.
 
-### 7.1 `robot5` 측 노드
-- SLAM 노드
-- map 저장/관리 노드
-- localization 노드
-- 카메라 드라이버 노드
-- YOLO 탐지 노드
-- victim localization 노드
-- victim report publisher
+- OS: Ubuntu 22.04
+- ROS 2: Humble
+- Python: 3.10 계열
+- Build tool: `colcon`
+- Package install: `rosdep`, `pip`
 
-예시 토픽:
-- `/robot5/map`
-- `/robot5/camera/rgb/image_raw`
-- `/robot5/camera/depth/image_raw`
-- `/robot5/victim_detection`
-- `/robot5/victim_pose`
+추가 런타임 전제:
 
-### 7.2 `robot6` 측 노드
-- localization 노드
-- navigation 노드
-- mission subscriber
-- YOLO-Pose 분석 노드
-- speech interface 노드
-- mission result publisher
+- GPU: 선택 사항이지만 `camera_system`, `rescue_bot`의 YOLO/Whisper 추론은 CUDA 가능 GPU가 있으면 유리합니다.
+- CUDA: 현재 로컬 환경은 CUDA 12.4 경로가 잡혀 있습니다.
+- Audio: `rescue_stt_node` 실행 시 마이크 입력, 스피커 출력, PortAudio/ALSA 계열 시스템 라이브러리가 필요합니다.
+- Robot navigation: `robot5_person_search`, `rescue_bot`는 Nav2 및 TurtleBot4 관련 패키지가 준비되어 있어야 합니다.
 
-예시 토픽:
-- `/robot6/goal_pose`
-- `/robot6/pose_assessment`
-- `/robot6/tts/text`
-- `/robot6/stt/result`
-- `/robot6/mission_status`
-
-### 7.3 메인 PC 노드
-- dashboard server
-- rosbridge server
-- event aggregator
-- logger / database interface
-
-예시 구독 토픽:
-- `/map`
-- `/robot5/victim_pose`
-- `/robot6/mission_status`
-- `/robot6/pose_assessment`
-
-### 7.4 웹캠 PC 노드
-- webcam1 capture publisher
-- webcam2 capture publisher
-
-예시 토픽:
-- `/external_cam1/image_raw`
-- `/external_cam2/image_raw`
-
----
-
-## 8. 프로젝트에서 가장 중요한 설계 포인트
-
-### 8.1 공통 좌표계 사용
-이 프로젝트에서 가장 중요한 것은 **좌표계 통일**이다.
-
-`robot5`가 탐지한 요구조자의 위치를 `robot6`가 정확히 찾아가기 위해서는,
-두 로봇이 모두 **같은 `map` 기준 좌표계**를 공유해야 한다.
-
-즉, 아래 조건이 반드시 만족되어야 한다.
-- `robot5`가 생성하고 저장한 맵을 `robot6`가 사용할 수 있어야 함
-- `robot5`와 `robot6` 모두 공통 `map`에서 localization 되어야 함
-- camera frame → base_link → map 변환이 일관되어야 함
-
-### 8.2 요구조자 위치는 완성된 맵 기준 좌표여야 함
-YOLO는 bounding box나 keypoint를 제공하지만, 이는 픽셀 좌표에 불과하다.
-로봇이 실제로 이동하려면 최종적으로 다음 정보가 필요하다.
-- 완성된 `map` 좌표계 기준 `(x, y)` 또는 `(x, y, z)`
-
-이를 위해 필요하다.
-- Depth 카메라
-- 카메라 내부 파라미터
-- TF 변환
-- 거리 기반 투영 계산
-- 저장 맵 또는 안정화된 맵 기준 localization
-
-### 8.3 멀티머신 통신 안정성
-같은 Wi-Fi와 같은 Domain ID를 사용하더라도, 실제 멀티머신 환경에서는 아래 문제가 자주 발생한다.
-- discovery 불안정
-- 멀티캐스트 이슈
-- 영상 토픽 대역폭 부족
-- 시간 차이로 인한 데이터 mismatch
-
-따라서 네트워크와 QoS 설계가 매우 중요하다.
-
----
-
-## 9. 권장 구현 순서
-
-### 1단계. `robot5`의 SLAM 안정화
-- 맵 생성
-- 탐색 주행
-- 맵 저장 및 공유 검증
-
-### 2단계. 저장 맵 기준 localization 구성
-- `robot5`가 완성된 맵 기준으로 localization 가능한 상태인지 검증
-- 탐지/좌표화가 안정화된 `map` 기준으로 기록되는지 확인
-
-### 3단계. `robot5`의 요구조자 위치 추정
-- YOLO 탐지
-- Depth 기반 거리 추정
-- TF를 이용한 `map` 좌표 변환
-- `/robot5/victim_pose` publish
-
-### 4단계. `robot6`의 맵 공유 및 localization
-- 동일 맵 사용
-- AMCL 또는 대응 localization 구성
-- goal pose 기반 이동 테스트
-
-### 5단계. `robot5` → `robot6` 임무 전달
-- topic/service/action 중 하나 선택
-- 구조 임무 프로토콜 정의
-
-### 6단계. `robot6`의 YOLO-Pose 상태 판단 통합
-- 현재 `rescue_bot` 분석 모듈을 ROS 이미지 토픽 기반으로 전환
-- 위급도 판단 및 로깅 연동
-
-### 7단계. STT/TTS 대화 모듈 통합
-- 간단한 상태 확인 문장부터 시작
-- 대화 실패 시 재시도 로직 설계
-
-### 8단계. 대시보드 통합
-- `map`
-- `robot5` / `robot6` 현재 위치
-- victim marker
-- 상태 로그
-- 웹캠 영상
-
----
-
-## 10. 실행 개요
-
-> 아래 내용은 프로젝트 목표 구조를 기준으로 한 실행 개요이며, 현재 저장소만으로 전체 시나리오가 완전히 실행되지는 않는다.
-
-### 10.1 현재 저장소 기준 실행 대상
-- SRD 분석 노드
-- DB 저장 노드
-- Flask 대시보드
-
-### 10.2 현재 저장소 기준 실행 예시
+환경 준비 예시:
 
 ```bash
-colcon build --packages-select rescue_bot
+source /opt/ros/humble/setup.bash
+cd /home/gom/rokey_ws
+python3 -m pip install -r requirements.txt
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install
 source install/setup.bash
-ros2 launch rescue_bot srd_system.launch.py
 ```
 
-웹 대시보드는 별도 실행이 필요하다.
+## Package Summary
+
+### 1. camera_system
+- USB 카메라 영상을 퍼블리시합니다.
+- YOLO 기반 감지 결과를 생성합니다.
+- 감지 결과를 시각화하고 붕괴 이벤트를 감지합니다.
+- 대표 실행 노드:
+  - `camera_publisher`
+  - `detection_node`
+  - `overlay_node`
+  - `collapse_detector`
+
+### 2. robot5_person_search
+- robot5가 탐색 중 사람을 찾으면 이벤트를 발생시킵니다.
+- 검출 위치와 피해자 방향 정보를 후속 시스템에 넘깁니다.
+- 대표 실행 노드:
+  - `person_event_detector`
+  - `explore_detect_supervisor`
+
+### 3. rescue_bot
+- robot6 도착 이후 구조 세션을 시작합니다.
+- `rescue_vision_core`로 자세/위급도 분석을 수행합니다.
+- `rescue_nav_node`가 목표 이동과 도킹을 관리합니다.
+- `rescue_stt_node`가 구조 대화와 음성 입출력을 처리합니다.
+- 웹 UI도 포함합니다.
+- 대표 실행 노드:
+  - `rescue_control_node`
+  - `rescue_nav_node`
+  - `rescue_stt_node`
+  - `rescue_ui`
+
+## Runtime Flow
+
+실로봇 기준 구조 흐름은 다음 순서입니다.
+
+1. `robot5_person_search`가 사람 검출 이벤트를 발생시킵니다.
+2. `rescue_nav_node`가 `/robot5/robot_pose_at_detection`, `/robot5/victim_point`를 받아 목표 주행을 수행합니다.
+3. 도착 시 `/robot6/mission/arrived`를 발행합니다.
+4. `rescue_control_node`가 세션을 시작하고 비전 분석 후 `/robot6/tts/request`에 상태 문자열을 발행합니다.
+5. `rescue_stt_node`가 대화 시나리오를 수행하고 `/robot6/tts/done`을 발행합니다.
+6. `rescue_nav_node`가 다음 목표 또는 도킹 단계로 진행합니다.
+
+자세한 계약은 [src/rescue_bot/docs/robot6_runtime_contract.md](/home/gom/rokey_ws/src/rescue_bot/docs/robot6_runtime_contract.md) 를 참고하면 됩니다.
+
+## Python Requirements
+
+공용 Python 패키지는 루트 [requirements.txt](/home/gom/rokey_ws/requirements.txt) 에 정리했습니다.
+
+설치:
 
 ```bash
-python3 rescue_bot/web/srd_flask_server.py
+python3 -m pip install -r /home/gom/rokey_ws/requirements.txt
 ```
 
-> 주의:
-> 현재 저장소의 `setup.py`, `package.xml`, 모델 경로, Python 의존성 선언은 실제 배포 수준으로 완성되어 있지 않으므로,
-> 환경에 따라 추가 수정이 필요하다.
+포함되는 대표 항목:
+- `numpy`
+- `opencv-python`
+- `ultralytics`
+- `torch`
+- `torchvision`
+- `Flask`
+- `pygame`
+- `SpeechRecognition`
+- `openai-whisper`
+- `gTTS`
+- `PyAudio`
 
----
+## ROS / System Dependencies
 
-## 11. 기대 효과
+아래 항목은 `pip`가 아니라 ROS 패키지 또는 시스템 패키지로 준비해야 합니다.
 
-- 단일 로봇이 아닌 **다중 로봇 협업 구조 시나리오** 구현
-- SLAM과 인명 탐지를 결합한 **공간 기반 구조 지원 시스템** 구현
-- 요구조자 탐지 후 단순 발견을 넘어, **접근-판단-상호작용-지원**까지 이어지는 시나리오 구성
-- 발표 및 시연 관점에서 높은 전달력 확보
+- ROS2 기본: `rclpy`, `sensor_msgs`, `std_msgs`, `geometry_msgs`, `nav_msgs`
+- TF / 브리지: `tf2_ros`, `tf2_geometry_msgs`, `cv_bridge`
+- Navigation: `nav2_simple_commander`, `turtlebot4_navigation`, `explore_lite_msgs`
+- Launch / Web: `launch`, `launch_ros`, `rosbridge_server`, `web_video_server`
+- 오디오 장치: 마이크, 스피커, PortAudio/ALSA 관련 시스템 라이브러리
 
----
+권장 설치 방식:
 
-## 12. 결론
+```bash
+cd /home/gom/rokey_ws
+rosdep install --from-paths src --ignore-src -r -y
+```
 
-본 프로젝트는 **TurtleBot4 두 대를 이용한 협업형 구조 지원 시스템**을 목표로 하며,
-`robot5`는 **탐색과 발견**, `robot6`는 **접근과 대응**을 맡는 역할 분담 구조를 가진다.
+## Build
+
+```bash
+cd /home/gom/rokey_ws
+colcon build --symlink-install
+source install/setup.bash
+```
+
+## Run
+
+### camera_system
+
+```bash
+ros2 launch camera_system camera_system.launch.py
+```
+
+### robot5_person_search
+
+```bash
+ros2 launch robot5_person_search robot5_person_search.launch.py
+```
+
+### rescue_bot real runtime
+
+```bash
+ros2 launch rescue_bot rescue_real.launch.py
+```
+
+### rescue_bot simulator runtime
+
+```bash
+ros2 launch rescue_bot rescue_sim.launch.py
+```
+
+## Verification
+
+기본 확인 순서는 아래를 권장합니다.
+
+1. Python 의존성 설치
+2. `rosdep install`
+3. `colcon build --symlink-install`
+4. `source install/setup.bash`
+5. 각 launch 실행
+6. `ros2 node list`, `ros2 topic list`로 노드/토픽 확인
+
+예시:
+
+```bash
+ros2 node list
+ros2 topic list
+ros2 topic echo /robot6/mission/arrived
+ros2 topic echo /robot6/tts/request
+ros2 topic echo /robot6/tts/done
+```
+
+## Notes
+
+- `rescue_bot`의 YOLO pose 모델 기본값은 `yolo11n-pose.pt` 입니다.
+- 현재 `rescue_bot`의 `nav` 입력 기준은 `/rescue/victim_pose_stamped`가 아니라 robot5 토픽 체인입니다.
+- STT 노드는 Python 패키지 외에도 실제 오디오 입출력 장치 상태에 영향을 받습니다.
